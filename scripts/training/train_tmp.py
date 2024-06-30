@@ -9,14 +9,13 @@ import sys
 import json
 import itertools
 import random
-import time
 from copy import deepcopy
 from pathlib import Path
 from functools import partial
 from typing import List, Iterator, Optional, Dict
 
 import ipdb
-import pandas as pd
+import datasets
 import typer
 from typer_config import use_yaml_config
 import numpy as np
@@ -45,10 +44,9 @@ from gluonts.transform import (
 )
 
 from chronos import ChronosConfig, ChronosTokenizer
-from datasets import load_from_disk
 
+os.environ["WANDB_PROJECT"] = "chronos_w_our_data_uni_arrow"
 app = typer.Typer(pretty_exceptions_enable=False)
-os.environ["WANDB_PROJECT"] = "chronos_w_our_data"
 
 
 def is_main_process() -> bool:
@@ -76,24 +74,17 @@ def get_training_job_info() -> Dict:
 
     # CUDA info
     job_info["cuda_available"] = torch.cuda.is_available()
-    print(job_info)
     if torch.cuda.is_available():
         job_info["device_count"] = torch.cuda.device_count()
-        print(job_info)
 
         job_info["device_names"] = {
             idx: torch.cuda.get_device_name(idx)
             for idx in range(torch.cuda.device_count())
         }
-        print(job_info)
-
-        print(torch.cuda.mem_get_info(device=0))
-        print(torch.cuda.mem_get_info(device=1))
         job_info["mem_info"] = {
             idx: torch.cuda.mem_get_info(device=idx)
             for idx in range(torch.cuda.device_count())
         }
-        print(job_info)
 
     # DDP info
     job_info["torchelastic_launched"] = dist.is_torchelastic_launched()
@@ -252,7 +243,6 @@ class PseudoShuffledIterableDataset(IterableDataset):
                 idx = torch.randint(
                     len(shuffle_buffer), size=(), generator=self.generator
                 )
-                # print(idx)
                 yield shuffle_buffer.pop(idx)
 
         while shuffle_buffer:
@@ -332,25 +322,19 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
         self.np_dtype = np_dtype
 
     def preprocess_entry(self, entry: dict, mode: str) -> dict:
-        entry_freq = entry['freq']
         entry = {f: entry[f] for f in ["start", "target"]}
         entry["target"] = np.asarray(entry["target"], dtype=self.np_dtype)
         assert entry["target"].ndim == 1, f"got {entry['target'].ndim=}, expected 1"
 
-        # Change the start time to a period
-        entry['start'] = pd.Period(entry['start'], freq=entry_freq)
-
         if mode == "training" and self.drop_prob > 0:
-            # ipdb.set_trace()
             target = entry["target"].copy()
-            # ipdb.set_trace()
             drop_p = np.random.uniform(low=0.0, high=self.drop_prob)
             mask = np.random.choice(
                 [True, False], size=len(target), p=[drop_p, 1 - drop_p]
             )
             target[mask] = np.nan
             entry["target"] = target
-        # print(entry["start"])
+
         return entry
 
     def _create_instance_splitter(self, mode: str):
@@ -402,10 +386,7 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
             past_target
         )
         future_target = torch.tensor(entry["future_target"]).unsqueeze(0)
-        # t1 = time.time()
-        # print('start tokenizing labels')
         labels, labels_mask = self.tokenizer.label_input_transform(future_target, scale)
-        # print('done tokenizing labels, time elapsed:', time.time() - t1)
         labels[labels_mask == 0] = -100
         return {
             "input_ids": input_ids.squeeze(0),
@@ -414,7 +395,6 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
         }
 
     def __iter__(self) -> Iterator:
-        print('preprocessing started')
         preprocessed_datasets = [
             Map(
                 partial(self.preprocess_entry, mode=self.mode),
@@ -422,7 +402,7 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
             )
             for dataset in self.datasets
         ]
-        print('preprocessing done')
+
         if self.mode == "training":
             iterables = [
                 self.create_training_data(dataset) for dataset in preprocessed_datasets
@@ -450,16 +430,12 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
 
         probs = [prob / sum(probs) for prob in probs]
 
-        print('right before listing iterators')
         iterators = list(map(iter, iterables))
-        print('len(iterators):', len(iterators))
         if self.mode == "training":
             while True:
                 idx = np.random.choice(range(len(iterators)), p=probs)
                 try:
-                    # t1 = time.time()
                     yield self.to_hf_format(next(iterators[idx]))
-                    # print('yielded one, time elapsed:', time.time() - t1)
                 except StopIteration:
                     probs[idx] = 0
                     if sum(probs) == 0:
@@ -562,6 +538,12 @@ def main(
         f"Mixing probabilities: {probability}",
         logger,
     )
+    # freqs = []
+    # for data_path in training_data_paths:
+    #     ds = datasets.Dataset.from_file(data_path).with_format("numpy")
+    #     freqs.append(ds[0]['freq'])
+    # print('freqs:', freqs)
+    # ipdb.set_trace()
 
     train_datasets = [
         Filter(
@@ -570,13 +552,11 @@ def main(
                 min_length=min_past + prediction_length,
                 max_missing_prop=max_missing_prop,
             ),
-            # FileDataset(path=Path(data_path), freq="h"),
-            load_from_disk(data_path)
+            FileDataset(path=Path(data_path), freq='h'),
         )
-        for data_path in training_data_paths
+        for idx, data_path in enumerate(training_data_paths)
     ]
 
-    # ipdb.set_trace()
     log_on_main("Initializing model", logger)
 
     model = load_model(
@@ -619,7 +599,6 @@ def main(
         mode="training",
     ).shuffle(shuffle_buffer_length=shuffle_buffer_length)
 
-    # ipdb.set_trace()
     wandb_run_name = model_id.split("-")[-1] + "-" + 'lr-' + str(learning_rate) + '-max_steps-' + str(max_steps) + \
                      '-seed-' + str(seed)
     # Define training args
@@ -633,10 +612,10 @@ def main(
         logging_dir=str(output_dir / "logs"),
         logging_strategy="steps",
         logging_steps=log_steps,
-        run_name=wandb_run_name,
         save_strategy="steps",
         save_steps=save_steps,
         report_to=["tensorboard", 'wandb'],
+        run_name=wandb_run_name,
         max_steps=max_steps,
         gradient_accumulation_steps=gradient_accumulation_steps,
         dataloader_num_workers=dataloader_num_workers,

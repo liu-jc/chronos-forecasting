@@ -14,6 +14,8 @@ from pathlib import Path
 from functools import partial
 from typing import List, Iterator, Optional, Dict
 
+import ipdb
+import datasets
 import typer
 from typer_config import use_yaml_config
 import numpy as np
@@ -43,7 +45,7 @@ from gluonts.transform import (
 
 from chronos import ChronosConfig, ChronosTokenizer
 
-
+os.environ["WANDB_PROJECT"] = "chronos_w_our_data_uni_arrow"
 app = typer.Typer(pretty_exceptions_enable=False)
 
 
@@ -339,7 +341,7 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
         assert mode in ["training", "test", "validation"]
 
         instance_sampler = {
-            "training": ExpectedNumInstanceSampler(
+            "training": ExpectedNumInstanceSampler( # to check
                 num_instances=1.0,
                 min_instances=1,
                 min_past=self.min_past,
@@ -536,6 +538,17 @@ def main(
         f"Mixing probabilities: {probability}",
         logger,
     )
+    freqs = []
+    freq_map = {'MS': 'M',
+                } # the map changes the pandas frequency of the data to the one accepted by gluonts.
+    for data_path in training_data_paths:
+        ds = datasets.Dataset.from_file(data_path)
+        cur_freq = ds[0]['freq']
+        if ds[0]['freq'] in freq_map:
+            cur_freq = freq_map[cur_freq]
+        freqs.append(cur_freq)
+    print('freqs:', freqs)
+    # ipdb.set_trace()
 
     train_datasets = [
         Filter(
@@ -544,9 +557,9 @@ def main(
                 min_length=min_past + prediction_length,
                 max_missing_prop=max_missing_prop,
             ),
-            FileDataset(path=Path(data_path), freq="h"),
+            FileDataset(path=Path(data_path), freq=freqs[idx]),
         )
-        for data_path in training_data_paths
+        for idx, data_path in enumerate(training_data_paths)
     ]
 
     log_on_main("Initializing model", logger)
@@ -591,6 +604,8 @@ def main(
         mode="training",
     ).shuffle(shuffle_buffer_length=shuffle_buffer_length)
 
+    wandb_run_name = 'all-univar' + model_id.split("-")[-1] + "-" + 'lr-' + str(learning_rate) + '-max_steps-' + str(max_steps) + \
+                     '-bs-' + str(per_device_train_batch_size) + '-seed-' + str(seed)
     # Define training args
     training_args = TrainingArguments(
         output_dir=str(output_dir),
@@ -604,7 +619,8 @@ def main(
         logging_steps=log_steps,
         save_strategy="steps",
         save_steps=save_steps,
-        report_to=["tensorboard"],
+        report_to=["tensorboard", 'wandb'],
+        run_name=wandb_run_name,
         max_steps=max_steps,
         gradient_accumulation_steps=gradient_accumulation_steps,
         dataloader_num_workers=dataloader_num_workers,
@@ -613,7 +629,8 @@ def main(
         ddp_find_unused_parameters=False,
         remove_unused_columns=False,
     )
-
+    print('Before training')
+    # ipdb.set_trace()
     # Create Trainer instance
     trainer = Trainer(
         model=model,
