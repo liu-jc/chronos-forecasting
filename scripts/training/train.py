@@ -241,6 +241,7 @@ class PseudoShuffledIterableDataset(IterableDataset):
         shuffle_buffer = []
 
         for element in self.base_dataset:
+            # print('element:', element)
             shuffle_buffer.append(element)
             if len(shuffle_buffer) >= self.shuffle_buffer_length:
                 idx = torch.randint(
@@ -488,7 +489,17 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
         iterators = list(map(iter, iterables))
         if self.mode == "training":
             while True:
+                # print('len(iterators):', len(iterators))
                 idx = np.random.choice(range(len(iterators)), p=probs)
+                # try:
+                #     idx = np.random.choice(range(len(iterators)), p=probs)
+                # except ValueError:
+                #     print('datasets:', self.datasets)
+                #     print('preprocessed_datasets:', preprocessed_datasets)
+                #     print('self.mode:', self.mode)
+                #     print('len(iterators):', len(iterators))
+                #     print('probs:', probs)
+                #     print('iterables:', iterables)
                 try:
                     yield self.to_hf_format(next(iterators[idx]))
                 except StopIteration:
@@ -540,6 +551,7 @@ def main(
     top_k: int = 50,
     top_p: float = 1.0,
     seed: Optional[int] = None,
+    wandb_prefix: Optional[str] = None,
 ):
     if tf32 and not (
         torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
@@ -594,11 +606,14 @@ def main(
     freq_map = {'MS': 'M',
                 } # the map changes the pandas frequency of the data to the one accepted by gluonts.
     for data_path in training_data_paths:
-        ds = datasets.Dataset.from_file(data_path)
-        cur_freq = ds[0]['freq']
-        if ds[0]['freq'] in freq_map:
-            cur_freq = freq_map[cur_freq]
-        freqs.append(cur_freq)
+        try:
+            ds = datasets.Dataset.from_file(data_path)
+            cur_freq = ds[0]['freq']
+            if ds[0]['freq'] in freq_map:
+                cur_freq = freq_map[cur_freq]
+            freqs.append(cur_freq)
+        except Exception as e:
+            freqs.append('h') # for synthetic data
     print('freqs:', freqs)
     # ipdb.set_trace()
 
@@ -658,8 +673,11 @@ def main(
         mode="training",
     ).shuffle(shuffle_buffer_length=shuffle_buffer_length)
 
-    wandb_run_name = 'all-univar' + model_id.split("-")[-1] + "-" + 'lr-' + str(learning_rate) + '-max_steps-' + str(max_steps) + \
+    # print(f"shuffled_train_dataset.probabilities:{shuffled_train_dataset.probabilities}")
+    wandb_run_name = model_id.split("-")[-1] + "-" + 'lr-' + str(learning_rate) + '-max_steps-' + str(max_steps) + \
                      '-bs-' + str(per_device_train_batch_size) + '-seed-' + str(seed)
+    if wandb_prefix:
+        wandb_run_name = wandb_prefix + "-" + wandb_run_name
     # Define training args
     training_args = TrainingArguments(
         output_dir=str(output_dir),
